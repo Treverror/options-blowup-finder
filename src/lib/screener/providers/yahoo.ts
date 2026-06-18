@@ -117,42 +117,63 @@ export interface ChainForExpiry {
   puts: ChainOption[];
 }
 
-// Options chain for the nearest expiration at/after `afterDate`. Best-effort:
-// Yahoo's options endpoint can be rate-limited, in which case we return null
-// and the screener simply omits the contract idea for that name.
+// Options chain for the nearest expiration at/after `afterDate`. We use CBOE's
+// free, public delayed-quotes feed (no crumb/cookie, unlike Yahoo's locked-down
+// v7 options endpoint). Best-effort: returns null on failure and the screener
+// simply omits the contract idea for that name.
 export async function fetchChain(
   symbol: string,
   afterDate: Date
 ): Promise<ChainForExpiry | null> {
-  const base = await yahooJson(`/v7/finance/options/${encodeURIComponent(symbol)}`);
-  const result = base?.optionChain?.result?.[0];
-  if (!result) return null;
+  let data: any = null;
+  try {
+    const res = await fetch(
+      `https://cdn.cboe.com/api/global/delayed_quotes/options/${encodeURIComponent(
+        symbol
+      )}.json`,
+      { headers: HEADERS, cache: "no-store" }
+    );
+    if (res.ok) data = await res.json();
+  } catch {
+    return null;
+  }
 
-  const expirations: number[] = result.expirationDates ?? []; // epoch seconds
-  const targetSec =
-    expirations.find((e) => e * 1000 >= afterDate.getTime()) ??
-    expirations[expirations.length - 1];
-  if (!targetSec) return null;
+  const opts = data?.data?.options;
+  if (!Array.isArray(opts) || opts.length === 0) return null;
 
-  const detail = await yahooJson(
-    `/v7/finance/options/${encodeURIComponent(symbol)}?date=${targetSec}`
-  );
-  const chain = detail?.optionChain?.result?.[0]?.options?.[0];
-  if (!chain) return null;
+  // OCC symbol format: ROOT + YYMMDD + (C|P) + strike*1000 (8 digits).
+  const re = /([0-9]{6})([CP])([0-9]{8})$/;
+  const byExp = new Map<string, { calls: ChainOption[]; puts: ChainOption[] }>();
 
-  const map = (arr: any[] = []): ChainOption[] =>
-    arr.map((o: any) => ({
-      contractSymbol: o.contractSymbol,
-      strike: o.strike,
-      lastPrice: num(o.lastPrice),
-      impliedVolatility: num(o.impliedVolatility),
-      inTheMoney: Boolean(o.inTheMoney),
-    }));
+  for (const o of opts) {
+    const m = re.exec(o.option || "");
+    if (!m) continue;
+    const [, ymd, cp, strikeRaw] = m;
+    const expIso = `20${ymd.slice(0, 2)}-${ymd.slice(2, 4)}-${ymd.slice(4, 6)}`;
+    const opt: ChainOption = {
+      contractSymbol: o.option,
+      strike: parseInt(strikeRaw, 10) / 1000,
+      lastPrice: num(o.last_trade_price),
+      impliedVolatility: num(o.iv),
+      inTheMoney: false,
+    };
+    const bucket = byExp.get(expIso) ?? { calls: [], puts: [] };
+    (cp === "C" ? bucket.calls : bucket.puts).push(opt);
+    byExp.set(expIso, bucket);
+  }
 
+  const exps = [...byExp.keys()].sort();
+  const targetIso =
+    exps.find(
+      (e) => new Date(`${e}T00:00:00Z`).getTime() >= afterDate.getTime()
+    ) ?? exps[exps.length - 1];
+  if (!targetIso) return null;
+
+  const bucket = byExp.get(targetIso)!;
   return {
-    expiration: new Date(targetSec * 1000),
-    calls: map(chain.calls),
-    puts: map(chain.puts),
+    expiration: new Date(`${targetIso}T00:00:00Z`),
+    calls: bucket.calls,
+    puts: bucket.puts,
   };
 }
 
