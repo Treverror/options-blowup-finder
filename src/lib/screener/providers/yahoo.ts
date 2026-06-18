@@ -1,5 +1,11 @@
-import yahooFinance from "yahoo-finance2";
+import yahooFinanceTyped from "yahoo-finance2";
 import type { QuoteData } from "../../types";
+
+// yahoo-finance2's bundled types model the default export as a class
+// constructor, which doesn't match the singleton runtime API we actually use
+// (quote / chart / options / suppressNotices). Cast once to keep the
+// production type-check green; runtime behavior is unchanged.
+const yahooFinance: any = yahooFinanceTyped;
 
 // Silence the library's survey/validation notices in serverless logs.
 // Guarded so an API change in the dependency can't throw at module load.
