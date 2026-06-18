@@ -1,7 +1,7 @@
 import { env } from "../env";
 import type { Candidate, ScreenRun } from "../types";
 import { resolveUniverse } from "./universe";
-import { fetchQuotes, fetchTrailingChange } from "./providers/yahoo";
+import { fetchQuotes } from "./providers/yahoo";
 import { fetchSentiment } from "./providers/alphavantage";
 import {
   fetchEarningsCalendar,
@@ -36,13 +36,9 @@ export async function runScreen(): Promise<ScreenRun> {
     hasFinnhub ? fetchEarningsCalendar(0, 30) : Promise.resolve(new Map()),
   ]);
 
-  // Trailing 5-day change improves the sentiment-divergence read. Fetch only
-  // for names we actually have a quote for, with light concurrency.
+  // fetchQuotes already populates trailing 5-day change from the same chart
+  // call, so we just keep the names we actually got a quote for.
   const symbols = universe.filter((s) => quotes.has(s));
-  await mapLimit(symbols, 6, async (sym) => {
-    const q = quotes.get(sym);
-    if (q) q.changePct5d = await fetchTrailingChange(sym);
-  });
 
   // --- First pass: score with the cheap signals --------------------------
   const prelim: Candidate[] = [];
