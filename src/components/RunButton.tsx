@@ -1,48 +1,50 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
+import { runScreenAction } from "@/app/actions";
 
 export function RunButton() {
   const router = useRouter();
-  const [state, setState] = useState<"idle" | "running" | "error">("idle");
+  const [pending, startTransition] = useTransition();
   const [msg, setMsg] = useState<string>("");
+  const [error, setError] = useState(false);
 
-  async function run() {
-    setState("running");
+  function run() {
     setMsg("");
-    try {
-      const res = await fetch("/api/screen", { method: "POST" });
-      const json = await res.json();
-      if (!res.ok || !json.ok) {
-        setState("error");
+    setError(false);
+    startTransition(async () => {
+      try {
+        const r = await runScreenAction();
+        if (!r.ok) {
+          setError(true);
+          setMsg(r.error ?? "Run failed.");
+          return;
+        }
         setMsg(
-          json.error ??
-            (res.status === 401
-              ? "Endpoint is protected by CRON_SECRET — trigger it from the cron or unset the secret for manual runs."
-              : "Run failed.")
+          `Done — ${r.count} candidates${r.persisted ? "" : " (not saved: Supabase not configured)"}`
         );
-        return;
+        router.refresh();
+      } catch (e) {
+        setError(true);
+        setMsg((e as Error).message);
       }
-      setState("idle");
-      router.refresh();
-    } catch (e) {
-      setState("error");
-      setMsg((e as Error).message);
-    }
+    });
   }
 
   return (
     <div className="flex items-center gap-3">
       <button
         onClick={run}
-        disabled={state === "running"}
+        disabled={pending}
         className="rounded-lg bg-sky-500 px-4 py-2 text-sm font-semibold text-white transition hover:bg-sky-400 disabled:opacity-50"
       >
-        {state === "running" ? "Scanning…" : "Run screen now"}
+        {pending ? "Scanning…" : "Run screen now"}
       </button>
-      {state === "error" && (
-        <span className="max-w-md text-xs text-rose-300">{msg}</span>
+      {msg && (
+        <span className={`text-xs ${error ? "text-rose-300" : "text-emerald-300"}`}>
+          {msg}
+        </span>
       )}
     </div>
   );
