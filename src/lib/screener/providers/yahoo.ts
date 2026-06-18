@@ -1,72 +1,106 @@
-import yahooFinanceTyped from "yahoo-finance2";
 import type { QuoteData } from "../../types";
 
-// yahoo-finance2's bundled types model the default export as a class
-// constructor, which doesn't match the singleton runtime API we actually use
-// (quote / chart / options / suppressNotices). Cast once to keep the
-// production type-check green; runtime behavior is unchanged.
-const yahooFinance: any = yahooFinanceTyped;
+// We talk to Yahoo's public JSON endpoints directly. The v8 chart endpoint
+// needs no crumb/cookie (unlike the v7 quote endpoint), so it's reliable in a
+// serverless runtime — we derive price, volume, average volume and % changes
+// from a single 3-month daily history call per symbol.
 
-// Silence the library's survey/validation notices in serverless logs.
-// Guarded so an API change in the dependency can't throw at module load.
-try {
-  yahooFinance.suppressNotices?.(["yahooSurvey", "ripHistorical"]);
-} catch {
-  /* non-fatal */
+const HEADERS = {
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+  Accept: "application/json",
+};
+
+async function yahooJson(path: string): Promise<any | null> {
+  for (const host of ["query1", "query2"]) {
+    try {
+      const res = await fetch(`https://${host}.finance.yahoo.com${path}`, {
+        headers: HEADERS,
+        cache: "no-store",
+      });
+      if (res.ok) return await res.json();
+    } catch {
+      /* try next host */
+    }
+  }
+  return null;
 }
 
-// Batch-fetch quote snapshots. yahoo-finance2 accepts an array and returns
-// one object per symbol in a single request.
-export async function fetchQuotes(symbols: string[]): Promise<Map<string, QuoteData>> {
+async function mapLimit<T>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<void>
+): Promise<void> {
+  let i = 0;
+  const workers = Array.from(
+    { length: Math.min(limit, items.length) },
+    async () => {
+      while (i < items.length) {
+        await fn(items[i++]);
+      }
+    }
+  );
+  await Promise.all(workers);
+}
+
+// Fetch quote snapshots (price, volume, avg volume, recent % changes) for the
+// whole universe via the crumb-free chart endpoint.
+export async function fetchQuotes(
+  symbols: string[]
+): Promise<Map<string, QuoteData>> {
   const out = new Map<string, QuoteData>();
   if (symbols.length === 0) return out;
 
-  try {
-    const results = await yahooFinance.quote(symbols);
-    const list = Array.isArray(results) ? results : [results];
-    for (const q of list) {
-      if (!q?.symbol) continue;
-      out.set(q.symbol.toUpperCase(), {
-        symbol: q.symbol.toUpperCase(),
-        name: q.shortName ?? q.longName ?? null,
-        price: num(q.regularMarketPrice),
-        changePct: num(q.regularMarketChangePercent),
-        changePct5d: null, // filled in by history call below
-        volume: num(q.regularMarketVolume),
-        avgVolume: num(q.averageDailyVolume3Month),
-        marketCap: num(q.marketCap),
-      });
+  await mapLimit(symbols, 8, async (sym) => {
+    const data = await yahooJson(
+      `/v8/finance/chart/${encodeURIComponent(sym)}?range=3mo&interval=1d`
+    );
+    const result = data?.chart?.result?.[0];
+    if (!result) return;
+
+    const meta = result.meta ?? {};
+    const q = result.indicators?.quote?.[0] ?? {};
+    const closes: number[] = (q.close ?? []).filter(
+      (x: any) => typeof x === "number"
+    );
+    const vols: number[] = (q.volume ?? []).filter(
+      (x: any) => typeof x === "number"
+    );
+
+    const price =
+      num(meta.regularMarketPrice) ??
+      (closes.length ? closes[closes.length - 1] : null);
+    const prevClose = num(meta.chartPreviousClose) ?? num(meta.previousClose);
+    const changePct =
+      price != null && prevClose ? ((price - prevClose) / prevClose) * 100 : null;
+
+    let changePct5d: number | null = null;
+    if (closes.length >= 6) {
+      const a = closes[closes.length - 6];
+      const b = closes[closes.length - 1];
+      if (a) changePct5d = ((b - a) / a) * 100;
     }
-  } catch (err) {
-    console.error("[yahoo] quote batch failed:", (err as Error).message);
-  }
+
+    const avgVolume = vols.length
+      ? Math.round(vols.reduce((s, v) => s + v, 0) / vols.length)
+      : null;
+    const volume =
+      num(meta.regularMarketVolume) ??
+      (vols.length ? vols[vols.length - 1] : null);
+
+    out.set(sym.toUpperCase(), {
+      symbol: sym.toUpperCase(),
+      name: meta.shortName ?? meta.longName ?? meta.symbol ?? null,
+      price,
+      changePct,
+      changePct5d,
+      volume,
+      avgVolume,
+      marketCap: num(meta.marketCap) ?? null,
+    });
+  });
 
   return out;
-}
-
-// Trailing 5-session % change, used by the sentiment-divergence signal so a
-// stock that already ran on the news scores lower.
-export async function fetchTrailingChange(symbol: string): Promise<number | null> {
-  try {
-    const now = new Date();
-    const start = new Date(now.getTime() - 12 * 24 * 60 * 60 * 1000);
-    const chart = await yahooFinance.chart(symbol, {
-      period1: start,
-      period2: now,
-      interval: "1d",
-    });
-    const closes: number[] = ((chart.quotes ?? []) as any[])
-      .map((c: any) => c.close)
-      .filter((c: any): c is number => typeof c === "number");
-    if (closes.length < 2) return null;
-    const recent = closes.slice(-6); // ~5 sessions back
-    const first = recent[0];
-    const last = recent[recent.length - 1];
-    if (!first) return null;
-    return ((last - first) / first) * 100;
-  } catch {
-    return null;
-  }
 }
 
 export interface ChainOption {
@@ -83,41 +117,43 @@ export interface ChainForExpiry {
   puts: ChainOption[];
 }
 
-// Fetch the options chain for the nearest expiration at/after `afterDate`.
+// Options chain for the nearest expiration at/after `afterDate`. Best-effort:
+// Yahoo's options endpoint can be rate-limited, in which case we return null
+// and the screener simply omits the contract idea for that name.
 export async function fetchChain(
   symbol: string,
   afterDate: Date
 ): Promise<ChainForExpiry | null> {
-  try {
-    const base = await yahooFinance.options(symbol);
-    const dates: any[] = base.expirationDates ?? [];
-    const target =
-      dates.find((d: any) => d.getTime() >= afterDate.getTime()) ??
-      dates[dates.length - 1];
-    if (!target) return null;
+  const base = await yahooJson(`/v7/finance/options/${encodeURIComponent(symbol)}`);
+  const result = base?.optionChain?.result?.[0];
+  if (!result) return null;
 
-    const detail = await yahooFinance.options(symbol, { date: target });
-    const chain = detail.options?.[0];
-    if (!chain) return null;
+  const expirations: number[] = result.expirationDates ?? []; // epoch seconds
+  const targetSec =
+    expirations.find((e) => e * 1000 >= afterDate.getTime()) ??
+    expirations[expirations.length - 1];
+  if (!targetSec) return null;
 
-    const map = (arr: any[] = []): ChainOption[] =>
-      arr.map((o) => ({
-        contractSymbol: o.contractSymbol,
-        strike: o.strike,
-        lastPrice: num(o.lastPrice),
-        impliedVolatility: num(o.impliedVolatility),
-        inTheMoney: Boolean(o.inTheMoney),
-      }));
+  const detail = await yahooJson(
+    `/v7/finance/options/${encodeURIComponent(symbol)}?date=${targetSec}`
+  );
+  const chain = detail?.optionChain?.result?.[0]?.options?.[0];
+  if (!chain) return null;
 
-    return {
-      expiration: target,
-      calls: map(chain.calls),
-      puts: map(chain.puts),
-    };
-  } catch (err) {
-    console.error(`[yahoo] options ${symbol} failed:`, (err as Error).message);
-    return null;
-  }
+  const map = (arr: any[] = []): ChainOption[] =>
+    arr.map((o: any) => ({
+      contractSymbol: o.contractSymbol,
+      strike: o.strike,
+      lastPrice: num(o.lastPrice),
+      impliedVolatility: num(o.impliedVolatility),
+      inTheMoney: Boolean(o.inTheMoney),
+    }));
+
+  return {
+    expiration: new Date(targetSec * 1000),
+    calls: map(chain.calls),
+    puts: map(chain.puts),
+  };
 }
 
 function num(v: unknown): number | null {
