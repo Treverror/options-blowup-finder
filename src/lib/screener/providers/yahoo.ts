@@ -70,7 +70,13 @@ export async function fetchQuotes(
     const price =
       num(meta.regularMarketPrice) ??
       (closes.length ? closes[closes.length - 1] : null);
-    const prevClose = num(meta.chartPreviousClose) ?? num(meta.previousClose);
+    // Most-recent-session % change = last close vs the prior session's close.
+    // (meta.chartPreviousClose is the close BEFORE the 3-month window, which
+    // would give a 3-month move — not what we want here.)
+    const prevClose =
+      closes.length >= 2
+        ? closes[closes.length - 2]
+        : num(meta.chartPreviousClose) ?? num(meta.previousClose);
     const changePct =
       price != null && prevClose ? ((price - prevClose) / prevClose) * 100 : null;
 
