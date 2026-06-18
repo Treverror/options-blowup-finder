@@ -55,9 +55,9 @@ export async function fetchTrailingChange(symbol: string): Promise<number | null
       period2: now,
       interval: "1d",
     });
-    const closes = (chart.quotes ?? [])
-      .map((c) => c.close)
-      .filter((c): c is number => typeof c === "number");
+    const closes: number[] = ((chart.quotes ?? []) as any[])
+      .map((c: any) => c.close)
+      .filter((c: any): c is number => typeof c === "number");
     if (closes.length < 2) return null;
     const recent = closes.slice(-6); // ~5 sessions back
     const first = recent[0];
@@ -90,9 +90,9 @@ export async function fetchChain(
 ): Promise<ChainForExpiry | null> {
   try {
     const base = await yahooFinance.options(symbol);
-    const dates = base.expirationDates ?? [];
+    const dates: any[] = base.expirationDates ?? [];
     const target =
-      dates.find((d) => d.getTime() >= afterDate.getTime()) ??
+      dates.find((d: any) => d.getTime() >= afterDate.getTime()) ??
       dates[dates.length - 1];
     if (!target) return null;
 
