@@ -69,7 +69,7 @@ export async function loadLatestRun(): Promise<LatestRun | null> {
     .eq("run_id", runRow.id)
     .order("rank", { ascending: true });
 
-  const candidates: Candidate[] = (cands ?? []).map((r) => ({
+  const candidates: Candidate[] = (cands ?? []).map((r: any) => ({
     symbol: r.symbol,
     name: r.name,
     price: r.price,
